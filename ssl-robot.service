@@ -1,0 +1,15 @@
+[Unit]
+Description=SSL Omni Robot Controller
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/one/SSL
+Environment=VIRTUAL_ENV=/home/one/SSL/.venv
+Environment=PATH=/home/one/SSL/.venv/bin:/usr/local/bin:/usr/bin
+ExecStart=/home/one/SSL/.venv/bin/python main.py
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
