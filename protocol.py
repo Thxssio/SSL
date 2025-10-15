@@ -1,24 +1,29 @@
 # -*- coding: utf-8 -*-
-"""Lightweight UDP command server for SSL robot control.
+"""Lightweight UDP/Serial command servers for SSL robot control.
 
 Notes
 -----
 - Author: Mauricio Moraes Godoy
-- Date: 2025-09-15
+- Date: 2025-09-15 (atualizado)
 
-Protocol
---------
+Protocol (UDP)
+--------------
 JSON messages over UDP. Supported commands:
 
-- {"cmd": "vel", "vx": float, "vy": float, "vtheta": float, "heading": float|null}
+- {"cmd": "vel", "vx": float, "vy": float, "vtheta": float, "heading": float|null, "kick": 0|1}
+- {"cmd": "drive", "vx": float, "vy": float, "vtheta": float,
+   "theta": float|null, "theta_target": float|null, "kick": 0|1}
 - {"cmd": "stop"}
 - {"cmd": "heading", "theta": float}      # set desired heading target
-- {"cmd": "imu", "theta": float}           # update measured heading
+- {"cmd": "imu", "theta": float}          # update measured heading
 - {"cmd": "ping"}
-- {"cmd": "drive", "vx": float, "vy": float, "vtheta": float,
-   "theta": float|null, "theta_target": float|null}
 
-Responses (optional when ack=True): {"ok": true, "cmd": "<name>"}
+Optional fields:
+- "id": inteiro para filtro de destino do robô
+- "k": alias para "kick" (0/1, bool, ou float; >= threshold dispara)
+
+Responses (when ack=True):
+- {"ok": true, "cmd": "<name>"}
 """
 
 import errno
@@ -29,7 +34,7 @@ import socket
 import time
 from typing import Callable, Optional, Tuple
 
-import serial
+import serial  # pyserial
 
 from ssl_robot import SSLRobot
 
@@ -47,6 +52,19 @@ class UDPCommandServer:
         UDP port to listen on.
     ack : bool, default False
         If True, send a small JSON acknowledgment back to the sender.
+    idle_timeout : float, default 0.25
+        Stop robot if no commands arrive within this time (seconds).
+    poll_interval : float, default 0.01
+        Select() loop poll interval (seconds).
+    kick_handler : Optional[Callable[[bool, float], None]]
+        Função chamada com (is_active, raw_value) quando houver campo 'kick'/'k' no pacote.
+        Envie 0/1 via rádio. O handler deve tratar borda 0→1 se precisar pulso.
+    kick_threshold : float, default 0.5
+        Se 'kick' vier como float, valores >= threshold contam como ativo.
+    target_id : Optional[int]
+        Se definido, ignora pacotes cujo 'id' != target_id.
+    log_values : bool, default False
+        Logar valores recebidos em 'vel' e 'drive'.
     """
 
     def __init__(
@@ -57,6 +75,11 @@ class UDPCommandServer:
         ack: bool = False,
         idle_timeout: float = 0.25,
         poll_interval: float = 0.01,
+        *,
+        kick_handler: Optional[Callable[[bool, float], None]] = None,
+        kick_threshold: float = 0.5,
+        target_id: Optional[int] = None,
+        log_values: bool = False,
     ):
         self.robot = robot
         self.host = host
@@ -68,6 +91,10 @@ class UDPCommandServer:
         self.poll_interval = max(1e-3, float(poll_interval))
         self._last_command_time = time.monotonic()
         self._last_zero_sent = False
+        self._kick_handler = kick_handler
+        self._kick_threshold = float(kick_threshold)
+        self._target_id = target_id
+        self._log_values = bool(log_values)
 
     def start(self):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -134,6 +161,30 @@ class UDPCommandServer:
         self._last_zero_sent = True
         self._last_command_time = now
 
+    def _maybe_kick(self, payload: dict):
+        if self._kick_handler is None:
+            return
+        raw = payload.get("kick", payload.get("k", 0))
+        try:
+            if isinstance(raw, bool):
+                is_active = raw
+                val = 1.0 if raw else 0.0
+            else:
+                val = float(raw)
+                # interpreta 0/1 ou float com threshold
+                try:
+                    is_active = bool(int(round(val)))
+                except Exception:
+                    is_active = (val >= self._kick_threshold)
+        except Exception:
+            is_active, val = False, 0.0
+        try:
+            self._kick_handler(is_active, val)
+        except TypeError:
+            self._kick_handler(is_active)  # compat
+        except Exception:
+            pass
+
     def _handle_packet(self, data: bytes, addr: Tuple[str, int]):
         try:
             payload = json.loads(data.decode("utf-8"))
@@ -145,6 +196,15 @@ class UDPCommandServer:
         handled = False
         zero_command = False
 
+        # filtro por id (opcional)
+        if self._target_id is not None and payload.get("id") != self._target_id:
+            if self.ack and self.sock is not None:
+                try:
+                    self.sock.sendto(b'{"ok":false,"err":"id"}', addr)
+                except Exception:
+                    pass
+            return False, False, self._last_zero_sent
+
         if cmd == "vel":
             vx = float(payload.get("vx", 0.0))
             vy = float(payload.get("vy", 0.0))
@@ -152,8 +212,10 @@ class UDPCommandServer:
             heading = payload.get("heading")
             heading = float(heading) if heading is not None else None
             self.robot.set_velocity(vx, vy, vtheta, heading=heading)
+            self._maybe_kick(payload)
             handled = True
             zero_command = (abs(vx) < 1e-6 and abs(vy) < 1e-6 and abs(vtheta) < 1e-6)
+
         elif cmd == "drive":
             vx = float(payload.get("vx", 0.0))
             vy = float(payload.get("vy", 0.0))
@@ -173,25 +235,43 @@ class UDPCommandServer:
                     self.robot.set_heading_target(float(theta_target))
                 except Exception:
                     pass
-            self.robot.set_velocity(vx, vy, vtheta*5, heading=heading_arg)
+            # mantém teu ganho atual no vtheta:
+            self.robot.set_velocity(vx, vy, vtheta * 5, heading=heading_arg)
+            self._maybe_kick(payload)
             handled = True
             zero_command = (abs(vx) < 1e-6 and abs(vy) < 1e-6 and abs(vtheta) < 1e-6)
+
         elif cmd == "stop":
             self.robot.stop()
             handled = True
             zero_command = True
+
         elif cmd == "heading":
             theta = float(payload.get("theta", 0.0))
             self.robot.set_heading_target(theta)
             handled = True
+
         elif cmd == "imu":
             theta = float(payload.get("theta", 0.0))
             self.robot.update_heading(theta)
             handled = True
+
         elif cmd == "ping":
             handled = True
+
         else:
             ok = False
+
+        if self._log_values and handled and cmd in ("vel", "drive"):
+            try:
+                kv = payload.get("kick", payload.get("k", 0))
+                print(
+                    f"[UDP {addr[0]}] cmd={cmd} "
+                    f"vx={payload.get('vx',0):+.3f} vy={payload.get('vy',0):+.3f} "
+                    f"w={payload.get('vtheta',0):+.3f} kick={kv}"
+                )
+            except Exception:
+                pass
 
         if self.ack and self.sock is not None:
             try:
@@ -210,7 +290,7 @@ class SerialCommandReader:
         id,vx,vy,vtheta,kick
     where the fields are separated by commas and optional whitespace.
     All numeric fields are parsed as floats except ``id`` which is parsed as int.
-    The ``kick`` field is forwarded to an optional handler as a float.
+    The ``kick`` field is forwarded to an optional handler as a float/bool.
     """
 
     _LINE_REGEX = re.compile(r"[,\s]+")
@@ -339,7 +419,7 @@ class SerialCommandReader:
         self._buffer = bytearray(tail)
         if not head:
             return b""
-        # Keep only the most recent complete line and discard older ones to avoid latency buildup.
+        # Keep only the most recent complete line and discard older ones.
         return head.split(b"\n")[-1]
 
     def _dispatch_kick(self, kick_value: float):
@@ -350,7 +430,7 @@ class SerialCommandReader:
         except (TypeError, ValueError):
             is_active = bool(kick_value >= self._kick_threshold)
         try:
-            self._kick_handler(is_active, kick_value)
+            self._kick_handler(is_active, float(kick_value))
         except TypeError:
             self._kick_handler(is_active)
         except Exception as exc:
