@@ -1,36 +1,35 @@
-# -*- coding: utf-8 -*-
-
 import argparse
 import re
 import subprocess
 import threading
 import time
+import glob
+from typing import Optional
 
-try:
-    from .ssl_robot import SSLRobot
-    from .protocol import SerialCommandReader, UDPCommandServer
-except ImportError:
-    from ssl_robot import SSLRobot
-    from protocol import SerialCommandReader, UDPCommandServer
+# Imports locais (mesma pasta)
+from ssl_robot import SSLRobot
+from protocol import SerialCommandReader, UDPCommandServer
 
 
+# ---------------------------
+# Argumentos de linha de comando
+# ---------------------------
 def parse_args():
     parser = argparse.ArgumentParser(description="Run SSL omni robot controller")
 
-    # conexão
-    parser.add_argument("--port", default="/dev/ttyUSB0", help="Serial port")
-    parser.add_argument("--baudrate", type=int, default=57600, help="Baudrate")
+    # conexão com MOTORES (Dynamixel)
+    parser.add_argument("--port", default="/dev/ttyUSB0", help="Serial port (motores)")
+    parser.add_argument("--baudrate", type=int, default=57600, help="Baudrate (motores)")
 
     # geometria e parâmetros físicos
     parser.add_argument(
-        "--wheel-ids", nargs=4, type=int, default=[2, 3, 4, 1],
+        "--wheel-ids", nargs=4, type=int, default=[1, 2, 3, 4],
         help="Four wheel IDs in the same order as angles lists"
     )
     parser.add_argument(
         "--wheel-angles", nargs=4, type=float,
-        # φ_i (posições) conforme montagem atual: [30, 150, 225, 315] graus (CCW a partir de +x)
-        default=[30.0, 150.0, 225.0, 315.0],
-        help="Wheel MOUNTING angles φ_i in degrees (CCW from +x) — positions around the chassis"
+        default=[30.0, 150.0, 225.0, 315.0],  # φ_i (posições) CCW a partir de +x
+        help="Wheel MOUNTING angles φ_i in degrees (CCW from +x)"
     )
     parser.add_argument(
         "--wheel-dir", nargs=4, type=float, default=None,
@@ -59,10 +58,25 @@ def parse_args():
     # transformação de entrada (UI -> robô)
     parser.add_argument("--in-rotate-deg", type=float, default=180.0,
                         help="Rotate incoming (vx,vy) CCW in degrees before kinematics (UI→robot).")
-    parser.add_argument("--in-flip-x", action="store_true", default=True,
-                        help="Flip X after rotation (UI→robot).")
-    parser.add_argument("--in-flip-y", action="store_true", default=True,
-                        help="Flip Y after rotation (UI→robot). Default True to match your UI mapping.")
+    try:
+        parser.add_argument("--in-flip-x", action=argparse.BooleanOptionalAction, default=False,
+                            help="Flip X after rotation (UI→robot). Use --no-in-flip-x to disable.")
+    except Exception:
+        # mantém o mesmo default (=False) para compatibilidade
+        parser.add_argument("--in-flip-x", dest="in_flip_x", action="store_true", default=False,
+                            help="Flip X after rotation (UI→robot).")
+        parser.add_argument("--no-in-flip-x", dest="in_flip_x", action="store_false",
+                            help="Disable X flip after rotation (UI→robot).")
+
+    try:
+        parser.add_argument("--in-flip-y", action=argparse.BooleanOptionalAction, default=True,
+                            help="Flip Y after rotation (UI→robot). Use --no-in-flip-y to disable.")
+    except Exception:
+        parser.add_argument("--in-flip-y", dest="in_flip_y", action="store_true", default=True,
+                            help="Flip Y after rotation (UI→robot).")
+        parser.add_argument("--no-in-flip-y", dest="in_flip_y", action="store_false",
+                            help="Disable Y flip after rotation (UI→robot).")
+
     try:
         parser.add_argument("--in-swap-xy", action=argparse.BooleanOptionalAction, default=True,
                             help="Swap incoming vx↔vy before rotation (UI→robot).")
@@ -76,11 +90,14 @@ def parse_args():
     parser.add_argument("--heading-offset-deg", type=float, default=0.0,
                         help="Offset (deg) added to any heading/theta from vision before transforms.")
 
-    # protocolo
+    # protocolo de comandos (rádio/PC)
     parser.add_argument("--protocol", choices=["none", "udp", "serial"], default="serial", help="Command protocol")
+    # UDP
     parser.add_argument("--udp-host", default="0.0.0.0", help="UDP bind host")
     parser.add_argument("--udp-port", type=int, default=20011, help="UDP port")
     parser.add_argument("--udp-ack", action="store_true", help="Send ACK responses")
+    parser.add_argument("--udp-log-values", action="store_true", default=False, help="Log UDP received values")
+    # Serial (comandos)
     parser.add_argument("--serial-cmd-port", default="/dev/ttyACM0", help="Serial port for command input")
     parser.add_argument("--serial-cmd-baudrate", type=int, default=115200, help="Baudrate for command serial input")
     parser.add_argument("--serial-cmd-target-id", type=int, default=None, help="Only accept commands with this ID (optional)")
@@ -95,11 +112,29 @@ def parse_args():
                             help="Print parsed serial command lines")
         parser.add_argument("--no-serial-log-values", dest="serial_log_values", action="store_false",
                             help="Disable serial command logging")
-    parser.add_argument("--kick-enable", action="store_true", default=True,
-                        help="Enable GPIO kick pulse output triggered by command 'kick' field.")
+
+    # Kicker (GPIO por libgpiod)
+    try:
+        parser.add_argument("--kick-enable", action=argparse.BooleanOptionalAction, default=True,
+                            help="Enable GPIO kick pulse output triggered by command 'kick' field.")
+    except Exception:
+        parser.add_argument("--kick-enable", dest="kick_enable", action="store_true", default=True,
+                            help="Enable GPIO kick pulse output.")
+        parser.add_argument("--no-kick-enable", dest="kick_enable", action="store_false",
+                            help="Disable GPIO kick pulse output.")
+
     parser.add_argument("--kick-pin", type=int, default=26, help="BCM pin used for kick pulse output")
     parser.add_argument("--kick-pulse-ms", type=float, default=300.0, help="Kick pulse duration in milliseconds")
     parser.add_argument("--kick-threshold", type=float, default=0.5, help="Minimum kick value that triggers the pulse")
+
+    # comando direto (protocol=none)
+    parser.add_argument("--vx", type=float, default=0.0, help="vx (m/s)")
+    parser.add_argument("--vy", type=float, default=0.0, help="vy (m/s)")
+    parser.add_argument("--vtheta", type=float, default=0.0, help="angular vel (rad/s)")
+    parser.add_argument("--duration", type=float, default=3.0, help="run time (s)")
+    parser.add_argument("--kick", type=float, default=0.0, help="kick value (0/1) for protocol=none quick test")
+
+    # logs do robô
     try:
         parser.add_argument("--robot-verbose", action=argparse.BooleanOptionalAction, default=False,
                             help="Print robot command/feedback debug info")
@@ -109,92 +144,37 @@ def parse_args():
         parser.add_argument("--no-robot-verbose", dest="robot_verbose", action="store_false",
                             help="Silence robot command/feedback debug info")
 
-    # comando direto (protocol=none)
-    parser.add_argument("--vx", type=float, default=0.0, help="vx (m/s)")
-    parser.add_argument("--vy", type=float, default=0.0, help="vy (m/s)")
-    parser.add_argument("--vtheta", type=float, default=0.0, help="angular vel (rad/s)")
-    parser.add_argument("--duration", type=float, default=3.0, help="run time (s)")
-
-    # modo GPIO (curses + libgpiod) para pulsar linha
-    parser.add_argument("--gpio-pulse", action="store_true", default=False,
-                        help="Inicia modo curses que gera pulsos em um GPIO utilizando libgpiod.")
-    parser.add_argument("--gpio-pin", type=int, default=26,
-                        help="Número BCM da linha GPIO usada em --gpio-pulse.")
-    parser.add_argument("--gpio-pulse-ms", type=float, default=200.0,
-                        help="Duração do pulso em milissegundos para --gpio-pulse.")
-
     return parser.parse_args()
 
 
-def find_bcm_chip():
+# ---------------------------
+# Funções auxiliares GPIO (libgpiod) — KickPulseController
+# ---------------------------
+def find_bcm_chip_path() -> str:
+    """
+    Descobre o caminho absoluto do gpiochip Broadcom (Pi 3/4/5).
+    Retorna sempre algo como '/dev/gpiochip0'.
+    """
     try:
         out = subprocess.check_output(["gpiodetect"], text=True)
-    except (FileNotFoundError, subprocess.CalledProcessError) as exc:
-        raise RuntimeError("Não foi possível executar gpiodetect.") from exc
+        for line in out.splitlines():
+            # casa pi4 (pinctrl-bcm2835), pi5 (pinctrl-bcm2712), etc.
+            if "pinctrl-bcm" in line:
+                m = re.match(r"^\s*(gpiochip\d+)\b", line.strip())
+                if m:
+                    return f"/dev/{m.group(1)}"
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        pass
 
-    for line in out.splitlines():
-        if "pinctrl-bcm" in line:
-            match = re.match(r"^(gpiochip\d+)\s+\[", line)
-            if match:
-                return match.group(1)
-
-    return "gpiochip0"
-
-
-def run_gpio_pulse_ui(pin, pulse_ms):
-    pulse_s = pulse_ms / 1000.0
-
-    try:
-        import curses
-        import gpiod
-    except ImportError as exc:
-        raise RuntimeError("É necessário ter curses e python-libgpiod instalados para usar --gpio-pulse.") from exc
-
-    chip_name = find_bcm_chip()
-    request_type = getattr(gpiod, "LINE_REQ_DIR_OUT", None)
-    if request_type is None:
-        request_type = getattr(gpiod, "LINE_REQUEST_DIRECTION_OUTPUT", None)
-    if request_type is None:
-        raise RuntimeError("Versão do libgpiod não suportada: não há constante de saída.")
-
-    def _ui(stdscr):
-        stdscr.nodelay(True)
-        stdscr.addstr(0, 0, f"ESPAÇO => pulso {pulse_ms:.0f} ms no GPIO{pin} | 'q' sai")
-
-        chip = gpiod.Chip(chip_name)
-        line = None
-        requested = False
-        try:
-            line = chip.get_line(pin)
-            line.request(consumer=f"gpio{pin}-pulse", type=request_type, default_vals=[0])
-            requested = True
-
-            while True:
-                ch = stdscr.getch()
-                if ch == ord("q"):
-                    break
-                if ch == ord(" "):
-                    line.set_value(1)
-                    time.sleep(pulse_s)
-                    line.set_value(0)
-                time.sleep(0.01)
-        finally:
-            if requested:
-                try:
-                    line.set_value(0)
-                except Exception:
-                    pass
-                try:
-                    line.release()
-                except Exception:
-                    pass
-            chip.close()
-
-    curses.wrapper(_ui)
+    # Fallback: primeiro /dev/gpiochip* existente; se não houver, /dev/gpiochip0
+    chips = sorted(glob.glob("/dev/gpiochip*"))
+    if chips:
+        return chips[0]
+    return "/dev/gpiochip0"
 
 
 class KickPulseController:
-    """Edge-triggered GPIO pulse generator for the kicker output."""
+    """Edge-triggered GPIO pulse generator for the kicker output (libgpiod v1/v2)."""
 
     def __init__(self, pin: int, pulse_ms: float):
         self.pin = int(pin)
@@ -212,26 +192,29 @@ class KickPulseController:
         try:
             import gpiod
         except ImportError as exc:
-            raise RuntimeError("python-libgpiod não está instalado; não é possível acionar o kick.") from exc
+            raise RuntimeError("Módulo 'gpiod' não está instalado; não é possível acionar o kick.") from exc
 
-        chip_name = find_bcm_chip()
+        chip_path = find_bcm_chip_path()  # <-- agora sempre '/dev/gpiochipX'
         try:
-            chip = gpiod.Chip(chip_name)
+            chip = gpiod.Chip(chip_path)
         except Exception as exc:
-            raise RuntimeError(f"Falha ao abrir {chip_name}: {exc}") from exc
+            raise RuntimeError(f"Falha ao abrir {chip_path}: {exc}") from exc
 
         is_v2 = hasattr(chip, "request_lines")
         try:
             if is_v2:
-                line_mod = getattr(gpiod, "line", gpiod)
+                # ---------- libgpiod v2 ----------
+                line_mod = getattr(gpiod, "line", gpiod)  # enums no v2 ficam em gpiod.line
                 LineSettings = getattr(gpiod, "LineSettings")
                 settings = LineSettings(direction=line_mod.Direction.OUTPUT,
                                         output_value=line_mod.Value.INACTIVE)
+
                 if hasattr(gpiod, "LineConfig"):
                     lc = gpiod.LineConfig()
                     lc.add_line_settings([self.pin], settings)
                     req = chip.request_lines(consumer="kick-pulse", config=lc)
                 else:
+                    # variante portátil: dict {offset: LineSettings}
                     req = chip.request_lines(consumer="kick-pulse", config={self.pin: settings})
 
                 def set_high():
@@ -247,11 +230,11 @@ class KickPulseController:
                         pass
 
             else:
-                request_type = getattr(gpiod, "LINE_REQ_DIR_OUT", None)
+                # ---------- libgpiod v1 ----------
+                request_type = getattr(gpiod, "LINE_REQ_DIR_OUT", None) \
+                               or getattr(gpiod, "LINE_REQUEST_DIRECTION_OUTPUT", None)
                 if request_type is None:
-                    request_type = getattr(gpiod, "LINE_REQUEST_DIRECTION_OUTPUT", None)
-                if request_type is None:
-                    raise RuntimeError("libgpiod v1 sem constante LINE_REQ_DIR_OUT descoberta.")
+                    raise RuntimeError("libgpiod v1 sem constante LINE_REQ_DIR_OUT.")
                 line = chip.get_line(self.pin)
                 line.request(consumer="kick-pulse", type=request_type, default_vals=[0])
 
@@ -285,6 +268,8 @@ class KickPulseController:
         self._release = release
 
     def handle(self, is_active: bool, raw: float = 0.0):
+        """Chame com is_active=True para iniciar pulso; False é ignorado aqui.
+        A lógica de borda 0→1 pode ser feita no servidor; aqui garantimos 1 pulso/thread."""
         with self._lock:
             if is_active:
                 if not self._last_active:
@@ -314,6 +299,7 @@ class KickPulseController:
                 pass
             with self._lock:
                 self._pulse_thread = None
+                self._last_active = False
 
     def close(self):
         thread = None
@@ -338,16 +324,13 @@ class KickPulseController:
                 pass
 
 
+# ---------------------------
+# Main
+# ---------------------------
 def main():
     args = parse_args()
 
-    if args.gpio_pulse:
-        try:
-            run_gpio_pulse_ui(args.gpio_pin, args.gpio_pulse_ms)
-        except RuntimeError as exc:
-            print(f"[ERRO] {exc}")
-        return
-
+    # Inicializa o robô (motores)
     robot = SSLRobot(
         wheel_ids=args.wheel_ids,
         wheel_angles_deg=args.wheel_angles,    # φ_i (posições)
@@ -369,66 +352,82 @@ def main():
         verbose=args.robot_verbose,
     )
 
+    # Kick (GPIO) — só via comando do rádio
     kick_controller = None
     if args.kick_enable:
         try:
             kick_controller = KickPulseController(args.kick_pin, args.kick_pulse_ms)
-            print(f"[KICK] GPIO{args.kick_pin} pronto para pulsos de {args.kick_pulse_ms:.0f} ms.")
+            print(f"[KICK] GPIO{args.kick_pin} pronto ({args.kick_pulse_ms:.0f} ms).")
         except RuntimeError as exc:
             print(f"[KICK] Desativado: {exc}")
             kick_controller = None
 
-    # garante torque
+    # garante torque ligado
     try:
         robot.comm.enable_all_torque()
     except Exception as e:
         print(f"[WARN] enable_all_torque falhou: {e}")
 
     # --- modos de operação ---
-    if args.protocol == "udp":
-        server = UDPCommandServer(robot, host=args.udp_host, port=args.udp_port, ack=args.udp_ack)
-        try:
-            server.start()
-            print(f"UDP server listening on {args.udp_host}:{args.udp_port}")
-            server.serve_forever()
-        except KeyboardInterrupt:
-            pass
-        finally:
-            server.stop()
-            robot.stop()
-            if kick_controller is not None:
-                kick_controller.close()
-    elif args.protocol == "serial":
-        reader = SerialCommandReader(
-            robot,
-            port=args.serial_cmd_port,
-            baudrate=args.serial_cmd_baudrate,
-            target_id=args.serial_cmd_target_id,
-            poll_timeout=args.serial_poll_timeout,
-            idle_timeout=args.serial_idle_timeout,
-            log_invalid=args.serial_log_invalid,
-            kick_handler=kick_controller.handle if kick_controller else None,
-            kick_threshold=args.kick_threshold,
-            log_values=args.serial_log_values,
-        )
-        try:
-            print(f"Lendo comandos seriais de {args.serial_cmd_port} @ {args.serial_cmd_baudrate} baud")
-            reader.serve_forever()
-        except RuntimeError as exc:
-            print(f"[ERRO] {exc}")
-        finally:
-            reader.stop()
-            robot.stop()
-            if kick_controller is not None:
-                kick_controller.close()
-    else:
-        try:
-            robot.set_velocity(args.vx, args.vy, args.vtheta)
-            time.sleep(args.duration)
-        finally:
-            robot.stop()
-            if kick_controller is not None:
-                kick_controller.close()
+    try:
+        if args.protocol == "udp":
+            server = UDPCommandServer(
+                robot,
+                host=args.udp_host,
+                port=args.udp_port,
+                ack=args.udp_ack,
+                idle_timeout=0.25,
+                poll_interval=0.01,
+                kick_handler=kick_controller.handle if kick_controller else None,
+                kick_threshold=args.kick_threshold,
+                target_id=args.serial_cmd_target_id,  # reuso: filtra 'id' se quiser
+                log_values=args.udp_log_values,
+            )
+            try:
+                server.start()
+                print(f"[UDP] listening on {args.udp_host}:{args.udp_port}")
+                server.serve_forever()
+            except KeyboardInterrupt:
+                pass
+            finally:
+                server.stop()
+
+        elif args.protocol == "serial":
+            reader = SerialCommandReader(
+                robot,
+                port=args.serial_cmd_port,
+                baudrate=args.serial_cmd_baudrate,
+                target_id=args.serial_cmd_target_id,
+                poll_timeout=args.serial_poll_timeout,
+                idle_timeout=args.serial_idle_timeout,
+                log_invalid=args.serial_log_invalid,
+                kick_handler=kick_controller.handle if kick_controller else None,
+                kick_threshold=args.kick_threshold,
+                log_values=args.serial_log_values,
+            )
+            try:
+                print(f"[SERIAL] Lendo de {args.serial_cmd_port} @ {args.serial_cmd_baudrate} baud")
+                reader.serve_forever()
+            except KeyboardInterrupt:
+                pass
+            finally:
+                reader.stop()
+
+        else:  # protocol == "none" — teste rápido
+            try:
+                robot.set_velocity(args.vx, args.vy, args.vtheta)
+                # aciona kick se pedido
+                if kick_controller and args.kick >= args.kick_threshold:
+                    kick_controller.handle(True, raw=args.kick)
+                time.sleep(args.duration)
+            finally:
+                robot.stop()
+
+    finally:
+        # shutdown ordenado
+        robot.stop()
+        if kick_controller is not None:
+            kick_controller.close()
 
 
 if __name__ == "__main__":
