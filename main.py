@@ -59,7 +59,7 @@ def parse_args():
     parser.add_argument("--in-rotate-deg", type=float, default=180.0,
                         help="Rotate incoming (vx,vy) CCW in degrees before kinematics (UI→robot).")
     try:
-        parser.add_argument("--in-flip-x", action=argparse.BooleanOptionalAction, default=False,
+        parser.add_argument("--in-flip-x", action=argparse.BooleanOptionalAction, default=True,
                             help="Flip X after rotation (UI→robot). Use --no-in-flip-x to disable.")
     except Exception:
         # mantém o mesmo default (=False) para compatibilidade
@@ -69,10 +69,10 @@ def parse_args():
                             help="Disable X flip after rotation (UI→robot).")
 
     try:
-        parser.add_argument("--in-flip-y", action=argparse.BooleanOptionalAction, default=True,
+        parser.add_argument("--in-flip-y", action=argparse.BooleanOptionalAction, default=False,
                             help="Flip Y after rotation (UI→robot). Use --no-in-flip-y to disable.")
     except Exception:
-        parser.add_argument("--in-flip-y", dest="in_flip_y", action="store_true", default=True,
+        parser.add_argument("--in-flip-y", dest="in_flip_y", action="store_true", default=False,
                             help="Flip Y after rotation (UI→robot).")
         parser.add_argument("--no-in-flip-y", dest="in_flip_y", action="store_false",
                             help="Disable Y flip after rotation (UI→robot).")
@@ -81,7 +81,7 @@ def parse_args():
         parser.add_argument("--in-swap-xy", action=argparse.BooleanOptionalAction, default=True,
                             help="Swap incoming vx↔vy before rotation (UI→robot).")
     except Exception:
-        parser.add_argument("--in-swap-xy", dest="in_swap_xy", action="store_true", default=True,
+        parser.add_argument("--in-swap-xy", dest="in_swap_xy", action="store_true", default=False,
                             help="Swap incoming vx↔vy before rotation (UI→robot).")
         parser.add_argument("--no-in-swap-xy", dest="in_swap_xy", action="store_false",
                             help="Disable vx↔vy swap before rotation (UI→robot).")
