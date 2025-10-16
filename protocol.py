@@ -287,10 +287,12 @@ class SerialCommandReader:
     """Read velocity commands from a serial device.
 
     Expected line format (ASCII):
-        id,vx,vy,vtheta,kick
+        id,vx,vy,vtheta[,kick[,theta,theta_target]]
     where the fields are separated by commas and optional whitespace.
     All numeric fields are parsed as floats except ``id`` which is parsed as int.
-    The ``kick`` field is forwarded to an optional handler as a float/bool.
+    The ``theta`` (measured heading) and ``theta_target`` fields are optional; when present
+    they update the robot heading/target. The ``kick`` field is also optional and is
+    forwarded to an optional handler as a float/bool.
     """
 
     _LINE_REGEX = re.compile(r"[,\s]+")
@@ -375,7 +377,7 @@ class SerialCommandReader:
                     continue
 
                 try:
-                    cmd_id, vx, vy, vtheta, kick, text = self._parse_line(line)
+                    cmd_id, vx, vy, vtheta, theta, theta_target, kick, text = self._parse_line(line)
                 except ValueError as exc:
                     if self.log_invalid:
                         print(f"[SERIAL] Linha inválida ignorada: {exc}")
@@ -384,10 +386,36 @@ class SerialCommandReader:
                 if self.target_id is not None and cmd_id != self.target_id:
                     continue
 
-                if self._log_values:
-                    print(f"[SERIAL] id={cmd_id} vx={vx:.3f} vy={vy:.3f} vtheta={vtheta:.3f} kick={kick:.3f} | raw='{text}'")
+                if theta is not None:
+                    try:
+                        self.robot.update_heading(theta)
+                        heading_arg = theta
+                    except Exception:
+                        heading_arg = None
+                else:
+                    heading_arg = None
 
-                self.robot.set_velocity(vx, vy, vtheta)
+                if theta_target is not None:
+                    try:
+                        self.robot.set_heading_target(theta_target)
+                    except Exception:
+                        pass
+
+                if self._log_values:
+                    log_parts = [
+                        f"id={cmd_id}",
+                        f"vx={vx:.3f}",
+                        f"vy={vy:.3f}",
+                        f"vtheta={vtheta:.3f}",
+                    ]
+                    if theta is not None:
+                        log_parts.append(f"theta={theta:.3f}")
+                    if theta_target is not None:
+                        log_parts.append(f"theta_target={theta_target:.3f}")
+                    log_parts.append(f"kick={kick:.3f}")
+                    print(f"[SERIAL] {' '.join(log_parts)} | raw='{text}'")
+
+                self.robot.set_velocity(vx/1000, vy/1000, -vtheta/1000, heading=heading_arg)
                 self._dispatch_kick(kick)
 
                 self._last_command_time = time.monotonic()
@@ -448,16 +476,38 @@ class SerialCommandReader:
 
         # Permite espaços ou vírgulas múltiplas entre campos
         parts = [p for p in self._LINE_REGEX.split(text) if p]
-        if len(parts) < 5:
-            raise ValueError(f"esperados 5 campos, obtido {len(parts)}: '{text}'")
+        if len(parts) < 4:
+            raise ValueError(f"esperados >=4 campos, obtido {len(parts)}: '{text}'")
 
         try:
             cmd_id = int(float(parts[0]))
             vx = float(parts[1])
             vy = float(parts[2])
             vtheta = float(parts[3])
-            kick = float(parts[4])
         except ValueError as exc:
             raise ValueError(f"não foi possível converter campos numéricos: '{text}'") from exc
 
-        return cmd_id, vx, vy, vtheta, kick, text
+        # Campos opcionais
+        def _maybe_float(value):
+            low = value.strip().lower()
+            if low in ("", "none", "null", "nan"):
+                return None
+            try:
+                return float(value)
+            except ValueError as exc:
+                raise ValueError(f"não foi possível converter '{value}' em float: '{text}'") from exc
+
+        theta = None
+        theta_target = None
+        kick = 0.0
+
+        if len(parts) >= 5:
+            # Campo 5 é sempre o kick no novo formato; mantém compatibilidade com formato antigo.
+            kick_val = _maybe_float(parts[4])
+            kick = 0.0 if kick_val is None else kick_val
+        if len(parts) >= 6:
+            theta = _maybe_float(parts[5])
+        if len(parts) >= 7:
+            theta_target = _maybe_float(parts[6])
+
+        return cmd_id, vx, vy, vtheta, theta, theta_target, kick, text
